@@ -1,0 +1,6 @@
+version: 1
+service:
+  runtime: python
+  build_command: pip install -r requirements.txt
+  start_command: python main.py
+  port: 8080
