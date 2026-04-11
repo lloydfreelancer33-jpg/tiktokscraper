@@ -1,6 +1,7 @@
 version: 1
 service:
   runtime: python
-  build_command: pip install -r requirements.txt
+  # Install the system tool (ffmpeg) AND the python libraries
+  build_command: apt-get update && apt-get install -y ffmpeg && pip install -r requirements.txt
   start_command: python main.py
   port: 8080
