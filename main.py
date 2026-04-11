@@ -94,6 +94,10 @@ def get_video_setting(frames_data):
         logger.error(f"Setting AI failed: {e}")
         return "Unknown setting"
 
+@app.route('/')
+def health():
+    return "Worker is Online and Ready!"
+    
 # --- MAIN ENDPOINT ---
 @app.route('/process_video', methods=['POST'])
 def process_video():
