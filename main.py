@@ -1,5 +1,4 @@
-import os, json, base64, requests, subprocess, uuid, logging, glob
-import concurrent.futures
+import os, json, base64, requests, subprocess, uuid, logging, glob, time, threading
 from flask import Flask, request, jsonify
 from PIL import Image, ImageFilter, ImageStat
 from openai import OpenAI
@@ -25,37 +24,50 @@ def encode_image(image_path):
         return base64.b64encode(image_file.read()).decode('utf-8')
 
 def is_sharp(image_path, threshold=50):
-    """Uses PIL to detect blur. Returns True if sharp, False if blurry."""
     try:
-        img = Image.open(image_path).convert('L') # Convert to grayscale
-        edges = img.filter(ImageFilter.FIND_EDGES) # Highlight edges
+        img = Image.open(image_path).convert('L') 
+        edges = img.filter(ImageFilter.FIND_EDGES) 
         stat = ImageStat.Stat(edges)
-        variance = stat.var[0] # Calculate variance of edges
+        variance = stat.var[0] 
         return variance > threshold
     except Exception:
         return False
 
-# --- AI PARALLEL FUNCTIONS ---
+def fire_and_forget_dino(endpoint, payload):
+    """Pushes to DINO server in the background without waiting for a response."""
+    try:
+        # Short timeout just to ensure the connection opens, but we don't care about the long response
+        requests.post(endpoint, json=payload, timeout=3)
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Dino background push recorded an expected timeout/error: {e}")
+
+# --- AI SEQUENTIAL FUNCTIONS ---
 def get_coordinates(frames_data):
-    """Task A: Finds products and returns coordinates."""
-    logger.info(f"Sending {len(frames_data)} frames for coordinate detection...")
+    """Task A: Analyzes all frames to find products and intelligently filter empty ones."""
+    logger.info(f"Sending all {len(frames_data)} frames for coordinate detection at low-res...")
+    
     payload_imgs = [
-        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{f['b64']}"}}
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{f['b64']}", "detail": "low"}}
         for f in frames_data
     ]
     
     prompt = """
-    Analyze these frames. Return JSON strictly in this format:
+    You are a highly accurate computer vision assistant.
+    Analyze these frames. Identify the primary product being showcased.
+    
+    CRITICAL INSTRUCTION: Act as an intelligent filter. If a frame DOES NOT clearly contain the main product, you MUST return an empty array [] for the coordinates.
+    
+    Return JSON strictly in this format:
     {
       "frames": [
         {
           "id": "frame_id_from_image", 
           "has_product": true/false, 
-          "coords": [ymin, xmin, ymax, xmax] // Values 0-1000. Empty array if no product.
+          "coords": [ymin, xmin, ymax, xmax] // Bounding box values mapped from 0 to 1000. Provide empty array [] if no clear product is visible.
         }
       ]
     }
-    Make sure the 'id' matches the order provided exactly.
+    Make sure the 'id' matches the order provided exactly. Prioritize accuracy of the bounding box.
     """
     try:
         res = client.chat.completions.create(
@@ -69,19 +81,26 @@ def get_coordinates(frames_data):
         return []
 
 def get_video_setting(frames_data):
-    """Task B: Describes the general setting and OCR text."""
-    logger.info("Sending sample frames for video setting analysis...")
-    # We only need 2-3 frames to understand the setting, saving tokens.
-    sample_frames = [frames_data[0], frames_data[len(frames_data)//2], frames_data[-1]]
+    """Task B: Describes setting using exactly 3 spread-out frames."""
+    logger.info("Sending 3 spread-out frames for video setting analysis...")
+    
+    # Grab 3 frames: Start (hook), Middle (50%), End (95%)
+    if len(frames_data) >= 3:
+        sample_frames = [frames_data[0], frames_data[len(frames_data)//2], frames_data[-1]]
+    else:
+        sample_frames = frames_data
+
     payload_imgs = [
-        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{f['b64']}"}}
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{f['b64']}", "detail": "low"}}
         for f in sample_frames
     ]
     
     prompt = """
-    Analyze these sample frames from a TikTok video. 
-    Describe the environment, background, and extract ALL readable text (like prices, sizes, or brand names).
-    Return JSON: {"video_setting": "Your detailed description here"}
+    You are an AI analyzing e-commerce short-form videos.
+    Analyze these 3 spread-out frames (hook, middle, and end). 
+    1. Describe the environment and background briefly to summarize the video.
+    2. Extract ALL readable text (especially prices, sizes, or brand names).
+    Return JSON strictly in this format: {"video_setting": "Your detailed description here"}
     """
     try:
         res = client.chat.completions.create(
@@ -107,13 +126,13 @@ def process_video():
     run_id = uuid.uuid4().hex[:6]
     
     try:
-        # 1. Snap 2 frames per second (every 0.5s) directly from URL
+        # 1. Snap 2 frames per second
         logger.info("Running FFmpeg stream...")
         output_pattern = f"/tmp/frame_{run_id}_%04d.jpg"
         subprocess.run([
             'ffmpeg', '-i', video_url, 
-            '-vf', 'fps=2', # 2 frames per second
-            '-q:v', '2',    # High quality
+            '-vf', 'fps=2', 
+            '-q:v', '2',
             output_pattern, '-y'
         ], capture_output=True, timeout=60)
 
@@ -130,28 +149,28 @@ def process_video():
                     "b64": encode_image(file_path)
                 })
             else:
-                os.remove(file_path) # Toss blurry frame immediately
+                os.remove(file_path)
 
-        # Failsafe if video is too dark/blurry entirely
         if not clean_frames:
             return jsonify({"status": "skipped", "message": "No clear frames found"}), 200
 
-        # Optional: Limit to top 15 frames so we don't overload GPT tokens
-        clean_frames = clean_frames[:15] 
+        # 3. Sequential AI Execution with Cooldown
+        logger.info("Processing setting AI (3 frames)...")
+        video_setting = get_video_setting(clean_frames)
+        
+        logger.info("Cooling down for 2.5 seconds to prevent rate limits...")
+        time.sleep(2.5)
+        
+        logger.info(f"Processing coordinate AI for all {len(clean_frames)} frames...")
+        coords_data = get_coordinates(clean_frames)
 
-        # 3. Parallel AI Execution
-        logger.info(f"Triggering parallel AI for {len(clean_frames)} clean frames...")
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future_coords = executor.submit(get_coordinates, clean_frames)
-            future_setting = executor.submit(get_video_setting, clean_frames)
-            
-            coords_data = future_coords.result()
-            video_setting = future_setting.result()
-
-        # 4. Crop & Upload Valid Products
-        processed_results = []
+        # 4. Crop & Fire to DINO
+        processed_count = 0
         for f_info in coords_data:
-            if not f_info.get("has_product"):
+            c = f_info.get("coords", [])
+            
+            # Intelligent Filter: Skip if AI returned empty coordinates
+            if not f_info.get("has_product") or not c or len(c) != 4:
                 continue
                 
             local_frame = next((f for f in clean_frames if f["id"] == f_info["id"]), None)
@@ -160,11 +179,14 @@ def process_video():
             # Crop using PIL
             img = Image.open(local_frame["path"])
             w, h = img.size
-            c = f_info["coords"]
             
             left, top, right, bottom = int(c[1]*w/1000), int(c[0]*h/1000), int(c[3]*w/1000), int(c[2]*h/1000)
-            cropped_img = img.crop((left, top, right, bottom))
             
+            # Ensure crop boundaries are valid
+            if left >= right or top >= bottom:
+                continue
+
+            cropped_img = img.crop((left, top, right, bottom))
             crop_path = f"/tmp/crop_{run_id}_{f_info['id']}.jpg"
             cropped_img.save(crop_path, format="JPEG")
 
@@ -178,23 +200,18 @@ def process_video():
                 
             pub_url = f"{conf['SUPABASE_URL']}/storage/v1/object/public/shoe-crops/{storage_path}"
 
-            # Ping DINO Worker
-            dino_res = requests.post(f"{conf['DINO_ENDPOINT']}/match", json={"image": pub_url})
-            matches = dino_res.json().get("matches", []) if dino_res.status_code == 200 else []
+            # Fire and forget to DINO Worker
+            dino_endpoint = f"{conf['DINO_ENDPOINT']}/match" # Update to /vectorize if that is the exact route
+            threading.Thread(target=fire_and_forget_dino, args=(dino_endpoint, {"image": pub_url})).start()
 
-            processed_results.append({
-                "frame_id": f_info["id"],
-                "image_url": pub_url,
-                "matches": matches
-            })
-            
+            processed_count += 1
             if os.path.exists(crop_path): os.remove(crop_path)
 
         return jsonify({
-            "status": "success",
+            "status": "SUCCESS",
             "video_id": video_id,
             "video_setting": video_setting,
-            "processed_crops": processed_results
+            "crops_pushed_to_dino": processed_count
         })
 
     finally:
