@@ -164,12 +164,12 @@ def process_video():
         logger.info(f"Processing coordinate AI for all {len(clean_frames)} frames...")
         coords_data = get_coordinates(clean_frames)
 
-        # 4. Crop & Fire to DINO
+        # 4. Crop & Fire to DINO (Phase 2: Proactive Indexing)
         processed_count = 0
         for f_info in coords_data:
             c = f_info.get("coords", [])
             
-            # Intelligent Filter: Skip if AI returned empty coordinates
+            # Filter: Skip if no product detected
             if not f_info.get("has_product") or not c or len(c) != 4:
                 continue
                 
@@ -180,9 +180,9 @@ def process_video():
             img = Image.open(local_frame["path"])
             w, h = img.size
             
+            # Convert normalized 0-1000 coords to pixel values
             left, top, right, bottom = int(c[1]*w/1000), int(c[0]*h/1000), int(c[3]*w/1000), int(c[2]*h/1000)
             
-            # Ensure crop boundaries are valid
             if left >= right or top >= bottom:
                 continue
 
@@ -190,7 +190,7 @@ def process_video():
             crop_path = f"/tmp/crop_{run_id}_{f_info['id']}.jpg"
             cropped_img.save(crop_path, format="JPEG")
 
-            # Upload to Supabase
+            # Upload to Supabase Storage
             storage_path = f"tiktok_crops/{video_id}_{f_info['id']}.jpg"
             storage_url = f"{conf['SUPABASE_URL']}/storage/v1/object/shoe-crops/{storage_path}"
             headers = {"Authorization": f"Bearer {conf['SUPABASE_KEY']}", "Content-Type": "image/jpeg"}
@@ -200,9 +200,17 @@ def process_video():
                 
             pub_url = f"{conf['SUPABASE_URL']}/storage/v1/object/public/shoe-crops/{storage_path}"
 
-            # Fire and forget to DINO Worker
-            dino_endpoint = f"{conf['DINO_ENDPOINT']}/match" # Update to /vectorize if that is the exact route
-            threading.Thread(target=fire_and_forget_dino, args=(dino_endpoint, {"image": pub_url})).start()
+            # --- POINTING TO NEW ENDPOINT ---
+            dino_endpoint = f"{conf['DINO_ENDPOINT']}/index-video-frame"
+            
+            # Payload updated for Proactive matching & Lead tracking
+            payload = {
+                "video_id": video_id,
+                "image_url": pub_url,
+                "video_setting": video_setting 
+            }
+            
+            threading.Thread(target=fire_and_forget_dino, args=(dino_endpoint, payload)).start()
 
             processed_count += 1
             if os.path.exists(crop_path): os.remove(crop_path)
@@ -211,7 +219,7 @@ def process_video():
             "status": "SUCCESS",
             "video_id": video_id,
             "video_setting": video_setting,
-            "crops_pushed_to_dino": processed_count
+            "crops_pushed_to_index": processed_count
         })
 
     finally:
