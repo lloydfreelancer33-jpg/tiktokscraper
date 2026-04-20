@@ -1,5 +1,7 @@
 flask
-requests
+flask-cors
 pillow
 openai
 waitress
+python-dotenv
+requests
