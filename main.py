@@ -50,7 +50,7 @@ class FrontendLogger(logging.Handler):
 frontend_handler = FrontendLogger()
 logger.addHandler(frontend_handler)
 
-# --- CONFIG (Loading real keys) ---
+# --- CONFIG ---
 conf = {
     "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY"),
     "SUPABASE_URL": os.environ.get("SUPABASE_URL"),
@@ -99,6 +99,18 @@ def extract_frames(video_path, output_dir):
     frames = glob.glob(os.path.join(output_dir, "*.jpg"))
     frames.sort()
     return frames
+
+def download_carousel_image(url, output_path):
+    """Directly downloads images for TikTok carousels."""
+    try:
+        response = requests.get(url, timeout=20)
+        if response.status_code == 200:
+            with open(output_path, 'wb') as f:
+                f.write(response.content)
+            return True
+    except Exception as e:
+        logger.error(f"Carousel download failed: {e}")
+    return False
 
 # --- AI SEQUENTIAL FUNCTIONS ---
 def get_coordinates(frames_data):
@@ -183,27 +195,40 @@ def process_video():
     video_path = None
     
     try:
-        # 1. Handle Input
-        if 'video' in request.files:
+        # 1. Handle Input (Logic for both file uploads and Deno JSON carousels)
+        image_urls = []
+        video_id = str(uuid.uuid4())[:8]
+
+        if request.is_json:
+            data = request.get_json()
+            image_urls = data.get('image_urls', [])
+            video_id = data.get('video_id', video_id)
+            logger.info(f"Received JSON request for video_id: {video_id}")
+        elif 'video' in request.files:
             video_file = request.files['video']
-            video_id = request.form.get('video_id', str(uuid.uuid4())[:8])
-            if not video_file.filename:
-                return jsonify({"status": "error", "message": "No video file provided"}), 400
-            
+            video_id = request.form.get('video_id', video_id)
             video_path = os.path.join(video_run_dir, f"vid_{video_id}.mp4")
             video_file.save(video_path)
-            logger.info(f"Processing uploaded video: {video_file.filename}")
+            logger.info(f"Processing uploaded video file: {video_file.filename}")
         else:
-            return jsonify({"status": "error", "message": "No video uploaded"}), 400
+            return jsonify({"status": "error", "message": "No input provided"}), 400
 
-        # 2. Extract Real Frames via FFmpeg (Now fetches 3 frames)
-        logger.info(f"Extracting 3 frames for {video_id} using FFmpeg...")
-        frame_paths = extract_frames(video_path, video_run_dir)
+        # 2. Acquire Frames
+        frame_paths = []
+        if image_urls:
+            logger.info(f"Processing Carousel ({len(image_urls)} images)...")
+            for i, url in enumerate(image_urls[:5]): # Limits to 5 frames
+                p = os.path.join(video_run_dir, f"frame_{i:03d}.jpg")
+                if download_carousel_image(url, p):
+                    frame_paths.append(p)
+        else:
+            logger.info(f"Extracting 3 frames using FFmpeg...")
+            frame_paths = extract_frames(video_path, video_run_dir)
         
         if not frame_paths:
-            return jsonify({"status": "error", "message": "FFmpeg failed to extract any frames."}), 500
+            return jsonify({"status": "error", "message": "Failed to acquire frames."}), 500
 
-        # Convert real frames to Base64
+        # Convert to Base64
         clean_frames = []
         for i, path in enumerate(frame_paths):
             with open(path, "rb") as f:
@@ -214,7 +239,7 @@ def process_video():
                 "b64": f"data:image/jpeg;base64,{b64_data}"
             })
             
-        logger.info(f"Successfully extracted {len(clean_frames)} real frames.")
+        logger.info(f"Successfully prepared {len(clean_frames)} frames.")
 
         # 3. AI Execution
         video_setting = get_video_setting(clean_frames)
@@ -234,13 +259,12 @@ def process_video():
             local_frame = next((f for f in clean_frames if f["id"] == f_info["id"]), None)
             if not local_frame: continue
 
-            # Crop using PIL based on 0-1000 AI mapping
             img = Image.open(local_frame["path"])
             w, h = img.size
             
             left, top, right, bottom = int(c[1]*w/1000), int(c[0]*h/1000), int(c[3]*w/1000), int(c[2]*h/1000)
             
-            # Apply 10% Padding for better DINO matching
+            # 10% Padding logic
             padding_w = int((right - left) * 0.10)
             padding_h = int((bottom - top) * 0.10)
             
@@ -278,34 +302,26 @@ def process_video():
             }
             
             threading.Thread(target=fire_and_forget_dino, args=(dino_endpoint, dino_payload)).start()
-            
             processed_count += 1
             time.sleep(1.0)
             
         logger.info(f"Successfully processed {processed_count} crops for video {video_id}")
         
-        # 5. Return Success to Frontend
         return jsonify({
             "status": "SUCCESS",
             "video_id": video_id,
             "video_setting": video_setting,
             "crops_pushed_to_index": processed_count,
-            "message": f"Processed {len(clean_frames)} frames, uploaded {processed_count} crops",
-            "frames": [{"id": f["id"], "b64": f["b64"]} for f in clean_frames]
+            "message": f"Processed {len(clean_frames)} frames, uploaded {processed_count} crops"
         })
 
     except Exception as e:
-        logger.exception(f"Processing failed for video")
+        logger.exception(f"Processing failed")
         return jsonify({"status": "error", "message": str(e)}), 500
 
     finally:
-        # 6. Total Cleanup of the run directory
         if os.path.exists(video_run_dir):
-            for f in glob.glob(os.path.join(video_run_dir, "*")):
-                try: os.remove(f)
-                except: pass
-            try: os.rmdir(video_run_dir)
-            except: pass
+            shutil.rmtree(video_run_dir, ignore_errors=True)
 
 # --- SERVER STARTUP ---
 if __name__ == "__main__":
