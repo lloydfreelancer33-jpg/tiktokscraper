@@ -180,11 +180,13 @@ def get_video_setting(frames_data):
 
 @app.route('/')
 def health():
-    return jsonify({"status": "alive"})
+    """Explicit health check for Leapcell proxy"""
+    return jsonify({"status": "alive", "service": "video-framer"}), 200
 
-@app.route('/logs')
-def get_logs():
-    return jsonify({"logs": log_messages[-50:]})
+@app.route('/favicon.ico')
+def favicon():
+    """Prevents 404 errors from browsers/proxies looking for an icon"""
+    return "", 204
     
 # --- MAIN PIPELINE ENDPOINT ---
 @app.route('/process_video', methods=['POST'])
