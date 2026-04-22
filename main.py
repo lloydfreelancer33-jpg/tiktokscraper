@@ -194,7 +194,7 @@ def process_media():
                                 "image_url": master_b64,
                                 "video_setting": f"Source: {source_type} | Product: {product.get('name')}"
                             },
-                            timeout=7
+                            timeout=30
                         )
                         indexed_count += 1
                 except Exception as e:
