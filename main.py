@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TEMP_DIR = os.path.join(os.getcwd(), "temp_processing")
+TEMP_DIR = "/tmp/temp_processing"
 os.makedirs(TEMP_DIR, exist_ok=True)
 app = Flask(__name__)
 CORS(app)
